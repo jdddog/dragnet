@@ -5,29 +5,42 @@ import itertools
 import multiprocessing
 import os
 import re
+from dataclasses import dataclass
 
 import ftfy
-from lxml import etree
 import numpy as np
-
 from dragnet.blocks import Blockifier, simple_tokenizer, text_from_subtree
-from dragnet.compat import unicode_
 from dragnet.lcs import check_inclusion
+from lxml import etree
 
 
-RAW_HTML_DIRNAME = 'HTML'
-GOLD_STANDARD_DIRNAME = 'Corrected'
-GOLD_STANDARD_BLOCKS_DIRNAME = 'block_corrected'
+@dataclass
+class DatasetFormat:
+    """ Class for storing the settings used by each file format """
 
-RAW_HTML_EXT = '.html'
-GOLD_STANDARD_EXT = '.html.corrected.txt'
-GOLD_STANDARD_BLOCKS_EXT = '.block_corrected.txt'
+    raw_html_dirname: str = 'HTML'
+    gold_standard_dirname: str = 'Corrected'
+    gold_standard_blocks_dirname: str = 'block_corrected'
+    raw_html_ext: str = '.html'
+    gold_standard_ext: str = '.html.corrected.txt'
+    gold_standard_blocks_ext: str = '.block_corrected.txt'
+
+
+FORMATS = {
+    '1.0': DatasetFormat(),
+    '2.0': DatasetFormat(raw_html_dirname='html',
+                         gold_standard_dirname='meta',
+                         gold_standard_blocks_dirname='block_corrected',
+                         raw_html_ext='.html',
+                         gold_standard_ext='.toml',
+                         gold_standard_blocks_ext='.block_corrected.txt')
+}
 
 RE_COMMENTS_DELIM = re.compile(r'\n*!@#\$%\^&\*\(\)\s+COMMENTS\n*')
 
 
 def extract_all_gold_standard_data(data_dir, nprocesses=1,
-                                   overwrite=False, **kwargs):
+                                   overwrite=False, format='1.0', **kwargs):
     """
     Extract the gold standard block-level content and comment percentages from a
     directory of labeled data (only those for which the gold standard blocks are
@@ -41,11 +54,14 @@ def extract_all_gold_standard_data(data_dir, nprocesses=1,
         nprocesses (int): If > 1, use a :class:`multiprocessing.Pool` to
             parallelize the extractions
         overwrite (bool): If True, overwrite existing gold-standard blocks files.
+        format (str): The format of the dataset to load. Set to '1.0' by default.
+            Set to '2.0' to load .toml based files.
         **kwargs: passed into :func:`extract_gold_standard_blocks`
 
     See Also:
         :func:`extract_gold_standard_blocks`
     """
+    ds_format: DatasetFormat = FORMATS[format]
     use_pool = nprocesses > 1
     if use_pool:
         pool = multiprocessing.Pool(processes=nprocesses)
@@ -53,31 +69,33 @@ def extract_all_gold_standard_data(data_dir, nprocesses=1,
     # get the set of files that have already been block corrected
     # so that we don't block correct them again
     if overwrite is False:
-        gs_blocks_dir = os.path.join(data_dir, GOLD_STANDARD_BLOCKS_DIRNAME)
+        gs_blocks_dir = os.path.join(data_dir, ds_format.gold_standard_blocks_dirname)
         if not os.path.isdir(gs_blocks_dir):
             os.mkdir(gs_blocks_dir)
         gs_blocks_filenames = get_filenames(
-            gs_blocks_dir, full_path=False, match_regex=re.escape(GOLD_STANDARD_BLOCKS_EXT))
+            gs_blocks_dir, full_path=False, match_regex=re.escape(ds_format.gold_standard_blocks_ext))
         gs_blocks_fileroots = {
-            re.search(r'(.+)' + re.escape(GOLD_STANDARD_BLOCKS_EXT), gs_blocks_filename).group(1)
+            re.search(r'(.+)' + re.escape(ds_format.gold_standard_blocks_ext), gs_blocks_filename).group(1)
             for gs_blocks_filename in gs_blocks_filenames}
     else:
         gs_blocks_fileroots = set()
 
     # extract the block-level gold parse from
     # the set of files to be block corrected
-    gs_dir = os.path.join(data_dir, GOLD_STANDARD_DIRNAME)
+    gs_dir = os.path.join(data_dir, ds_format.gold_standard_dirname)
     gs_filenames = get_filenames(
-        gs_dir, full_path=False, match_regex=re.escape(GOLD_STANDARD_EXT))
+        gs_dir, full_path=False, match_regex=re.escape(ds_format.gold_standard_ext))
     for i, gs_filename in enumerate(gs_filenames):
-        gs_fileroot = re.search(r'(.+)' + re.escape(GOLD_STANDARD_EXT), gs_filename).group(1)
+        gs_fileroot = re.search(r'(.+)' + re.escape(ds_format.gold_standard_ext), gs_filename).group(1)
         if gs_fileroot in gs_blocks_fileroots:
             continue
         if i % 100 == 0:
             print('Extracting gold standard blocks for file "{}"'.format(gs_filename))
         if use_pool:
+            kwargs['format'] = format
             pool.apply_async(extract_gold_standard_blocks, (data_dir, gs_fileroot), kwargs)
         else:
+            kwargs['format'] = format
             extract_gold_standard_blocks(data_dir, gs_fileroot, **kwargs)
 
     # close out our pool
@@ -87,7 +105,7 @@ def extract_all_gold_standard_data(data_dir, nprocesses=1,
 
 
 def extract_gold_standard_blocks(data_dir, fileroot, encoding=None,
-                                 tokenizer=simple_tokenizer, cetr=False):
+                                 tokenizer=simple_tokenizer, cetr=False, format='1.0'):
     """
     Extract the gold standard block-level content and comments for a single
     observation identified by ``fileroot``, and write the results to file.
@@ -102,6 +120,8 @@ def extract_gold_standard_blocks(data_dir, fileroot, encoding=None,
         tokenizer (Callable): Object that takes a string and returns the tokens
             as a list of strings.
         cetr (bool): If True, parse the gold standard in clean eval format.
+        format (str): The format of the dataset to load. Set to '1.0' by default.
+            Set to '2.0' to load .toml based files.
 
     Notes:
         Results are written to a text file in the block-level gold standard dir
@@ -116,7 +136,7 @@ def extract_gold_standard_blocks(data_dir, fileroot, encoding=None,
         text; ``comments_frac`` is the same but for comments text.
     """
     # read the raw html, split it into blocks, and tokenize each block
-    raw_html = read_html_file(data_dir, fileroot, encoding=encoding)  # text is unicode
+    raw_html = read_html_file(data_dir, fileroot, encoding=encoding, format=format)  # text is unicode
     from dragnet.blocks import BlockifyError
     try:
         blocks = [b.text for b in Blockifier.blockify(raw_html)]  # text is bytes
@@ -139,6 +159,7 @@ def extract_gold_standard_blocks(data_dir, fileroot, encoding=None,
     for i, block_tokens in enumerate(blocks_tokens):
         all_blocks_tokens.extend(block_tokens)
         all_blocks_tokens_block_id.extend([i] * len(block_tokens))
+
     # TODO: do we really need `num_all_blocks_tokens`?
     # it was used to determine if there were more gold standard tokens than *all*
     # tokens, and if so, some info was written to disk
@@ -176,14 +197,15 @@ def extract_gold_standard_blocks(data_dir, fileroot, encoding=None,
 
         return (frac_blocks_tokens_in_gs, blocks_tokens_strs_in_gs)
 
-    gs_content, gs_comments = read_gold_standard_file(data_dir, fileroot, cetr)
+    gs_content, gs_comments = read_gold_standard_file(data_dir, fileroot, cetr=cetr, format=format)
     frac_blocks_tokens_in_gs_content, blocks_tokens_strs_in_gs_content = \
         get_frac_and_str_tokens_in_gs(gs_content)
     frac_blocks_tokens_in_gs_comments, blocks_tokens_strs_in_gs_comments = \
         get_frac_and_str_tokens_in_gs(gs_comments)
 
+    ds_format = FORMATS[format]
     output_fname = os.path.join(
-        data_dir, GOLD_STANDARD_BLOCKS_DIRNAME, fileroot + GOLD_STANDARD_BLOCKS_EXT)
+        data_dir, ds_format.gold_standard_blocks_dirname, fileroot + ds_format.gold_standard_blocks_ext)
     line_fmt = u'{frac_content}\t{frac_comments}\t{block_tokens}\t{content_tokens}\t{comment_tokens}\n'
     with io.open(output_fname, mode='w') as f:
         for block_id, block_tokens in enumerate(blocks_tokens):
@@ -226,7 +248,7 @@ def get_filenames(dirname, full_path=False, match_regex=None, extension=None):
             yield filename
 
 
-def read_html_file(data_dir, fileroot, encoding=None):
+def read_html_file(data_dir, fileroot, encoding=None, format='1.0'):
     """
     Read the HTML file corresponding to identifier ``fileroot``
     in the raw HTML directory below the root ``data_dir``.
@@ -239,8 +261,9 @@ def read_html_file(data_dir, fileroot, encoding=None):
     Returns:
         str
     """
+    ds_format: DatasetFormat = FORMATS[format]
     fname = os.path.join(
-        data_dir, RAW_HTML_DIRNAME, fileroot + RAW_HTML_EXT)
+        data_dir, ds_format.raw_html_dirname, fileroot + ds_format.raw_html_ext)
     encodings = (encoding,) if encoding else ('utf-8', 'iso-8859-1')  # 'utf-16'
     for encoding in encodings:
         try:
@@ -253,7 +276,7 @@ def read_html_file(data_dir, fileroot, encoding=None):
     return ftfy.fix_encoding(raw_html).strip()
 
 
-def read_gold_standard_file(data_dir, fileroot, encoding=None, cetr=False):
+def read_gold_standard_file(data_dir, fileroot, encoding=None, cetr=False, format='1.0'):
     """
     Read the gold standard content file corresponding to identifier ``fileroot``
     in the gold standard directory below the root ``data_dir``.
@@ -264,12 +287,15 @@ def read_gold_standard_file(data_dir, fileroot, encoding=None, cetr=False):
         encoding (str)
         cetr (bool): if True, assume no comments and parse the gold standard
             to remove tags
+        format (bool): if True, assume no comments and parse the gold standard
+            to remove tags
 
     Returns:
         List[str, str]: contents string and comments string, respectively
     """
+    ds_format: DatasetFormat = FORMATS[format]
     fname = os.path.join(
-        data_dir, GOLD_STANDARD_DIRNAME, fileroot + GOLD_STANDARD_EXT)
+        data_dir, ds_format.gold_standard_dirname, fileroot + ds_format.gold_standard_ext)
     encodings = (encoding,) if encoding else ('utf-8', 'utf-16', 'iso-8859-1')
     for encoding in encodings:
         try:
@@ -282,14 +308,25 @@ def read_gold_standard_file(data_dir, fileroot, encoding=None, cetr=False):
     if not gold_standard:
         return [u'', u'']
 
-    if not cetr:
-        content_comments = RE_COMMENTS_DELIM.split(gold_standard, maxsplit=1)
-        # if no comments delimiter found, append empty comments string
-        if len(content_comments) == 1:
-            content_comments = [content_comments[0], u'']
-    else:
-        tree = etree.fromstring(gold_standard, parser=etree.HTMLParser())
+    if format == '1.0':
+        if not cetr:
+            content_comments = RE_COMMENTS_DELIM.split(gold_standard, maxsplit=1)
+            # if no comments delimiter found, append empty comments string
+            if len(content_comments) == 1:
+                content_comments = [content_comments[0], u'']
+        else:
+            tree = etree.fromstring(gold_standard, parser=etree.HTMLParser())
+            content_comments = [u' '.join(text_from_subtree(tree)), u'']
+    elif format == '2.0':
+        # Load toml data
+        # toml parser has an issue with multiline text strings
+        text = gold_standard.split("'''")[1]
+        # data = toml.loads(gold_standard)
+        # text = data['text']
+        tree = etree.fromstring(text, parser=etree.HTMLParser())
         content_comments = [u' '.join(text_from_subtree(tree)), u'']
+    else:
+        raise NotImplementedError(f'Format version {format} is not implemented')
 
     # fix text in case of mangled encodings
     content_comments = [ftfy.fix_encoding(content_comments[0]).strip(),
@@ -298,7 +335,7 @@ def read_gold_standard_file(data_dir, fileroot, encoding=None, cetr=False):
     return content_comments
 
 
-def read_gold_standard_blocks_file(data_dir, fileroot, split_blocks=True):
+def read_gold_standard_blocks_file(data_dir, fileroot, split_blocks=True, format='1.0'):
     """
     Read the gold standard blocks file corresponding to identifier ``fileroot``
     in the gold standard blocks directory below the root ``data_dir``.
@@ -311,8 +348,9 @@ def read_gold_standard_blocks_file(data_dir, fileroot, split_blocks=True):
     Returns:
         str or List[str]
     """
+    ds_format: DatasetFormat = FORMATS[format]
     fname = os.path.join(
-        data_dir, GOLD_STANDARD_BLOCKS_DIRNAME, fileroot + GOLD_STANDARD_BLOCKS_EXT)
+        data_dir, ds_format.gold_standard_blocks_dirname, fileroot + ds_format.gold_standard_blocks_ext)
     with io.open(fname, mode='r') as f:
         data = f.read()
     if split_blocks:
@@ -328,7 +366,7 @@ def _parse_content_or_comments_blocks(blocks, block_pct_tokens_thresh):
     return (is_above_thresh, token_counts, all_tokens)
 
 
-def prepare_data(data_dir, fileroot, block_pct_tokens_thresh=0.1):
+def prepare_data(data_dir, fileroot, block_pct_tokens_thresh=0.1, format='1.0'):
     """
     Prepare data for a single HTML + gold standard blocks example, uniquely
     identified by ``fileroot``.
@@ -355,8 +393,8 @@ def prepare_data(data_dir, fileroot, block_pct_tokens_thresh=0.1):
     if not 0.0 <= block_pct_tokens_thresh <= 1.0:
         raise ValueError('block_pct_tokens_thresh must be in the range [0.0, 1.0]')
 
-    html = read_html_file(data_dir, fileroot)
-    blocks = read_gold_standard_blocks_file(data_dir, fileroot, split_blocks=True)
+    html = read_html_file(data_dir, fileroot, format=format)
+    blocks = read_gold_standard_blocks_file(data_dir, fileroot, split_blocks=True, format=format)
 
     content_blocks = []
     comments_blocks = []
@@ -377,7 +415,7 @@ def prepare_data(data_dir, fileroot, block_pct_tokens_thresh=0.1):
     return (html, parsed_content_blocks, parsed_comments_blocks)
 
 
-def prepare_all_data(data_dir, block_pct_tokens_thresh=0.1):
+def prepare_all_data(data_dir, block_pct_tokens_thresh=0.1, format='1.0'):
     """
     Prepare data for all HTML + gold standard blocks examples in ``data_dir``.
 
@@ -391,13 +429,13 @@ def prepare_all_data(data_dir, block_pct_tokens_thresh=0.1):
     See Also:
         :func:`prepare_data`
     """
-    gs_blocks_dir = os.path.join(data_dir, GOLD_STANDARD_BLOCKS_DIRNAME)
+    ds_format: DatasetFormat = FORMATS[format]
+    gs_blocks_dir = os.path.join(data_dir, ds_format.gold_standard_blocks_dirname)
     gs_blocks_filenames = get_filenames(
-        gs_blocks_dir, full_path=False, match_regex=re.escape(GOLD_STANDARD_BLOCKS_EXT))
+        gs_blocks_dir, full_path=False, match_regex=re.escape(ds_format.gold_standard_blocks_ext))
     gs_blocks_fileroots = (
-        re.search(r'(.+)' + re.escape(GOLD_STANDARD_BLOCKS_EXT), gs_blocks_filename).group(1)
+        re.search(r'(.+)' + re.escape(ds_format.gold_standard_blocks_ext), gs_blocks_filename).group(1)
         for gs_blocks_filename in gs_blocks_filenames)
 
-    return [prepare_data(data_dir, fileroot, block_pct_tokens_thresh)
+    return [prepare_data(data_dir, fileroot, block_pct_tokens_thresh, format=format)
             for fileroot in gs_blocks_fileroots]
-
